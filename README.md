@@ -4,7 +4,7 @@ Reference-free assembly of viral sequences using a compression-based methods.
 
 ## Install Virumble ##
 
-Then, clone the repository and compile the code using the following instructions:
+Clone the repository and compile the code using the following instructions:
 ```
 git clone https://github.com/viromelab/Virumble
 cd Virumble/
