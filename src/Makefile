@@ -6,7 +6,7 @@ CFLAGS = -O2 -g -march=x86-64 -funroll-loops -ffast-math -Wall -Wextra -pthread 
 LDFLAGS = -lm -pthread
 
 # Object files
-OBJ = virumble.o hash.o mem.o merge.o
+OBJ = virumble.o hash.o mem.o merge.o aux.o
 
 # Default target: build the executable
 .PHONY: all

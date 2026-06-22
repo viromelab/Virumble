@@ -1,5 +1,5 @@
 /**
- * recon.c - FCM-based read extension, contig assembly, and merging
+ * virumble.c - FCM-based read extension, contig assembly, and merging
  *
  * This program builds a Frequency Chaos Game Representation (FCGR) model
  * from a FASTQ file, extends reads that are not already covered by
@@ -7,62 +7,57 @@
  * redundancy.
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <getopt.h>
-#include <string.h>
-#include <time.h>
-#include <limits.h>
-
-#include "hash.h"
-#include "defs.h"
-#include "merge.h"
+#include "virumble.h"
 
 // ----------------------------------------------------------------------
-// Data structure for storing sequence positions
-// ----------------------------------------------------------------------
-typedef struct seq_info {
-    short int used;
-    long initial_position;
-    long last_position;
-} seq_info;
-
-typedef struct read_pair {
-    char *forward_read;
-    char *reverse_read;
-    short int valid; 
-} read_pair;
-
-// ----------------------------------------------------------------------
-// Global options
+// Global options (definitions)
 // ----------------------------------------------------------------------
 int number_of_threads = 1;
+
 char *forward_file = NULL;
 char *reverse_file = NULL;
-char *output_path = "output.tsv";
+char *additional_file = NULL;
+
+char *output_path = "output.fa";
+
 int context_size;
 int verbose = 0;
 int help_menu = 0;
 
-size_t capacity = 100000;  // initial capacity for sequence info array
+size_t capacity = 10000;  // initial capacity for sequence info array
 seq_info *arr_forward;
 seq_info *arr_reverse;
+seq_info *arr_additional; // only used if additional file is provided
 int last_sequence_id = 0;
+int seq_count = 0; // count of sequences processed for extension
+int min_length = 0; // minimum length of contigs to output
 
 
+int num_reads = 0;
+int length_all_sequences = 0;
+
+int avg_read_length = 0;
+
+
+pthread_mutex_t count_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t contig_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 HASH *hm;                      // hash map: kmer -> count
 
 // ----------------------------------------------------------------------
 // Contig assembly globals
 // ----------------------------------------------------------------------
-int max_substitutions = 3;                // substitution threshold (default)
-int overlap_threshold = 30; // minimum overlap length for merging contigs
+int max_overlap = -1;
+int min_overlap = -1;              // minimum overlap length for merging contigs
+int max_substitutions = -1;                // substitution threshold (default)
 
-char **list_contigs_found = NULL;         // dynamic list of contigs
-int num_contigs = 0;                      // number of contigs stored
-int contig_capacity = 0;              // allocated size
+float f_max_substitutions = 0.05;
+float f_max_overlap = 1.0;
+float f_min_overlap = 0.1;
+
+contig_info *list_contigs = NULL;        // dynamic list of contigs
+int num_contigs = 0;                     // number of contigs stored
+int contig_capacity = 0;                 // allocated size
 
 // ----------------------------------------------------------------------
 // Command line options
@@ -71,11 +66,13 @@ static struct option long_options[] = {
     {"help", no_argument, 0, 'h'},
     {"forward", required_argument, 0, 'f'},
     {"reverse", required_argument, 0, 'r'},
+    {"additional", required_argument, 0, 'a'},
     {"output", required_argument, 0, 'o'},
-    {"threads", required_argument, 0, 't'},
     {"context", required_argument, 0, 'c'},
     {"substitutions", required_argument, 0, 's'},
-    {"overlap", required_argument, 0, 'e'},
+    {"max_overlap", required_argument, 0, 'M'},
+    {"min_overlap", required_argument, 0, 'm'},
+    {"threads", required_argument, 0, 't'},
     {"verbose", no_argument, 0, 'v'},
     {0, 0, 0, 0}
 };
@@ -89,11 +86,14 @@ void program_usage(const char *prog) {
     printf("  -h, --help              Show this help\n");
     printf("  -f, --forward FILE      Forward FASTQ file (required)\n");
     printf("  -r, --reverse FILE      Reverse FASTQ file (required)\n");
-    printf("  -o, --output FILE       Output TSV file (default: output.tsv)\n");
-    printf("  -t, --threads N         Number of threads (default: 1)\n");
+    printf("  -a, --additional FILE   Additional FASTQ file (optional)\n");
+    printf("  -o, --output FILE       Output FASTA file (default: output.fa)\n");
     printf("  -c, --context N         Context size (kmer length, >=2)\n");
-    printf("  -s, --substitutions N   Max substitutions for merging (default: 3)\n");
-    printf("  -e, --overlap N         Minimum overlap for merging contigs (default: 30)\n");
+    printf("  -s, --substitutions N   Maximum number of substitutions for merging (can be set as the number of bases or as a percentage of the average read length)\n");
+    printf("  -M, --max_overlap N     Maximum overlap for merging contigs (can be set as the number of bases or as a percentage of the average read length)\n");
+    printf("  -m, --min_overlap N     Minimum overlap for merging contigs (can be set as the number of bases or as a percentage of the average read length)\n");
+    printf("  -l, --length N          Minimum length for output contigs (default: 0)\n");
+    printf("  -t, --threads N         Number of threads (default: 1)\n");
     printf("  -v, --verbose           Verbose output\n\n");
     help_menu = 1;
 }
@@ -107,17 +107,62 @@ int option_parsing(int argc, char *argv[]) {
         program_usage(argv[0]);
         return 0;
     }
-    while ((opt = getopt_long(argc, argv, "hf:r:o:t:c:vs:e:", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "hf:r:a:o:c:s:M:m:l:t:v", long_options, NULL)) != -1) {
         switch (opt) {
             case 'h': program_usage(argv[0]); return 0;
             case 'f': forward_file = optarg; break;
             case 'r': reverse_file = optarg; break;
+            case 'a': additional_file = optarg; break;
             case 'o': output_path = optarg; break;
-            case 't': number_of_threads = atoi(optarg); break;
             case 'c': context_size = atoi(optarg); break;
+
+            case 's': {
+                double val;
+                NumType type = parse_number(optarg, &val);
+                if (type == TYPE_INT) {
+                    max_substitutions = val;
+                } else if (type == TYPE_FLOAT) {
+                    f_max_substitutions = val;
+                } else {
+                    fprintf(stderr, "Error: -s requires a valid number (integer or float)\n");
+                    program_usage(argv[0]);
+                    return 1;
+                }
+                break;
+            }
+            case 'M': {
+                double val;
+                NumType type = parse_number(optarg, &val);
+                if (type == TYPE_INT) {
+                    max_overlap = val; 
+                } else if (type == TYPE_FLOAT) {
+                    f_max_overlap = val;
+                } else {
+                    fprintf(stderr, "Error: -M requires a valid number (integer or float)\n");
+                    program_usage(argv[0]);
+                    return 1;
+                }
+                break;
+            }
+            case 'm': {
+                double val;
+                NumType type = parse_number(optarg, &val);
+                if (type == TYPE_INT) {
+                    min_overlap = val;
+                } else if (type == TYPE_FLOAT) {
+                    f_min_overlap = val;
+                } else {
+                    fprintf(stderr, "Error: -m requires a valid number (integer or float)\n");
+                    program_usage(argv[0]);
+                    return 1;
+                }
+                break;
+            }
+
+            case 'l': min_length = atoi(optarg); break;
+            case 't': number_of_threads = atoi(optarg); break;
             case 'v': verbose = 1; break;
-            case 's': max_substitutions = atoi(optarg); break;
-            case 'e': overlap_threshold = atoi(optarg); break;
+
             default:  program_usage(argv[0]); return 1;
         }
     }
@@ -129,14 +174,23 @@ int option_parsing(int argc, char *argv[]) {
         printf("Error: context size must be at least 2.\n");
         return 1;
     }
+
+    
+
+    
+    // TODO - chaneg it so max_overlap and min_overlap are checked !!!
+
+
+
     if (access(output_path, F_OK) == 0) remove(output_path);
+
     return 0;
 }
 
 // ----------------------------------------------------------------------
 // Hash table operations
 // ----------------------------------------------------------------------
-static void IncrementKmer(const char *kmer) { //Increment the count of a kmer in the hash table, or set to 1 if unseen
+void IncrementKmer(const char *kmer) {
     int *val = GetValue(hm, kmer);
     if (val == NULL)
         SetValue(hm, kmer, 1);
@@ -174,7 +228,7 @@ void save_position(int id, long initial_position, long last_pos, seq_info *arr) 
 // ----------------------------------------------------------------------
 // Model training: read FASTQ, extract all kmers, update hash table
 // ----------------------------------------------------------------------
-void train_model(char *file_name, seq_info *arr) {
+int train_model(char *file_name, seq_info *arr) {
     FILE *file = fopen(file_name, "rb");
     if (!file) {
         perror("fopen");
@@ -188,60 +242,65 @@ void train_model(char *file_name, seq_info *arr) {
     int part_sequence = 0;
     long initial_position = 0;
     long last_pos = 0;
-    int id = 0;
+    int id = -1;
 
     char *kmer_ring = malloc(context_size + 1);
     if (!kmer_ring) { perror("malloc"); exit(1); }
     int ring_pos = 0;
     int full_slots = 0;
+    int length_sequences_curr_file = 0;
 
-    // Read file in chunks, process character by character
     while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, file)) > 0) {
         for (size_t idx = 0; idx < bytes_read; ++idx) {
-            
             char ch = buffer[idx];
 
             if (ch == '@') {
-                if (id > 0)
-                    save_position(id, initial_position, last_pos, arr); // save previous record's range
-                part_sequence = 0;   // reset state
-                ring_pos = 0;        // reset ring buffer
-                full_slots = 0;      // reset k-mer window
-                id++;                // increment record counter
+                if (id >= 0)
+                    save_position(id, initial_position, last_pos, arr);
+                //Reset values
+                part_sequence = 0;
+                ring_pos = 0;
+                full_slots = 0;
+                id++;
             }
             else if (ch == '+') {
-                part_sequence = 2; // quality header line, ignore
+                part_sequence = 2;
             }
             else if (ch == '\n') { 
-                if (part_sequence == 0) { //end of header, save initial position of sequence
+                if (part_sequence == 0) {
                     part_sequence = 1;
                     initial_position = file_pos + 1;
                 }
             }
-            else if (part_sequence == 1) { // in sequence part, process k-mers
+            else if (part_sequence == 1) {
                 kmer_ring[ring_pos] = ch;
                 ring_pos = (ring_pos + 1) % context_size;
-                if (full_slots < context_size) full_slots++; //if the ring buffer isn't full yet, increment the count of filled slots
+                if (full_slots < context_size) full_slots++;
                 if (full_slots == context_size) {
                     char kmer_str[context_size + 1];
                     int start = ring_pos;
-                    for (int i = 0; i < context_size; ++i) { // build k-mer string from ring buffer
+                    for (int i = 0; i < context_size; ++i) {
                         kmer_str[i] = kmer_ring[(start + i) % context_size];
                     }
                     kmer_str[context_size] = '\0';
-                    IncrementKmer(kmer_str); // update hash table count
+                    IncrementKmer(kmer_str);
                 }
+                length_sequences_curr_file++;
                 last_pos = file_pos;
             }
             file_pos++;
         }
     }
-    if (id > 0) //save the last record's position
+    if (id >= 0)
         save_position(id, initial_position, last_pos, arr);
-    last_sequence_id = id;
 
     free(kmer_ring);
     fclose(file);
+
+    num_reads += id + 1;
+    length_all_sequences += length_sequences_curr_file;
+
+    return id;
 }
 
 // ======================================================================
@@ -267,19 +326,19 @@ char generate_next_symbol(const char *context, int forward) {
         if (counts[i] > max_count) {
             max_count = counts[i];
             num_best = 0;
-            best_indices[num_best++] = i;          // new winner, reset list
+            best_indices[num_best++] = i;
         } else if (counts[i] == max_count && max_count > 0) {
-            best_indices[num_best++] = i;          // tie, add to list
+            best_indices[num_best++] = i;
         }
     }
 
-    if (max_count == 0) return '\0';                    // dead end
-    int idx = best_indices[rand() % num_best];          // random tiebreak
+    if (max_count == 0) return '\0';
+    int idx = best_indices[rand() % num_best];
     return bases[idx];
 }
 
-char * generate_sequence(const char *start_kmer, int forward) {
-    char *context = malloc(context_size +1); // +1 for null terminator
+char *generate_sequence(const char *start_kmer, int forward) {
+    char *context = malloc(context_size + 1);
     if (!context) { perror("malloc"); exit(1); }
 
     if (forward) {
@@ -290,7 +349,7 @@ char * generate_sequence(const char *start_kmer, int forward) {
         context[context_size - 1] = '\0';
     }
 
-    int max_len = 4096; // initial max length for generated sequence
+    int max_len = 4096;
     char *sequence = malloc(max_len + 1);
     if (!sequence) { perror("malloc"); exit(1); }
     sequence[0] = '\0';
@@ -298,20 +357,17 @@ char * generate_sequence(const char *start_kmer, int forward) {
 
     char next;
     while ((next = generate_next_symbol(context, forward)) != '\0') {
-        if (seq_len + 1 >= max_len) { 
-            return sequence; // reached max length, return what we have
+        if (seq_len + 1 >= max_len) {
+            return sequence;
         }
-
         sequence[seq_len++] = next;
         sequence[seq_len] = '\0';
 
-        //printf("Generated next symbol '%c' with context '%s' -> sequence so far: %d\n", next, context, seq_len); 
-
-        if (forward) { // shift context left and add next at the end
+        if (forward) {
             memmove(context, context + 1, context_size - 2);
             context[context_size - 2] = next;
             context[context_size - 1] = '\0';
-        } else { // shift context right and add next at the beginning
+        } else {
             memmove(context + 1, context, context_size - 2);
             context[0] = next;
             context[context_size - 1] = '\0';
@@ -321,7 +377,6 @@ char * generate_sequence(const char *start_kmer, int forward) {
     free(context);
     return sequence;
 }
-
 
 char *get_read_from_coordinates(long begin, long end, char *input_file) {
     FILE *f = fopen(input_file, "rb");
@@ -346,45 +401,36 @@ char *get_read_from_coordinates(long begin, long end, char *input_file) {
     return read;
 }
 
-char *extend_read(const char *read) {
+char *extend_read(const char *read, int read_id, char *input_file) {
     int read_len = strlen(read);
-    if (read_len < context_size) { // Read is shorter than the context size, skipping extension
-        if (verbose) fprintf(stderr, "Read too short, skipping extension\n");
+    if (read_len < context_size) {
+        if (verbose) fprintf(stderr, "Read too short (%d bp), skipping extension (ID: %d ; File: %s) ---%s---\n", read_len, read_id, input_file, read);
         return NULL;
     }
 
     char first_kmer[context_size + 1];
     char last_kmer[context_size + 1];
-    strncpy(first_kmer, read, context_size); // first k-mer from the read
+    strncpy(first_kmer, read, context_size);
     first_kmer[context_size] = '\0';
-    strncpy(last_kmer, read + read_len - context_size, context_size); // last k-mer from the read
+    strncpy(last_kmer, read + read_len - context_size, context_size);
     last_kmer[context_size] = '\0';
 
-    // Generate the following bases until we hit a dead end (no next symbol with count > 0)
     char *end_ext = generate_sequence(last_kmer, 1);
     char *begin_ext = generate_sequence(first_kmer, 0);
 
     int begin_len = strlen(begin_ext);
-    for (int i = 0; i < begin_len / 2; ++i) { // reverse the backward extension to get the correct order
+    for (int i = 0; i < begin_len / 2; ++i) {
         char tmp = begin_ext[i];
         begin_ext[i] = begin_ext[begin_len - 1 - i];
         begin_ext[begin_len - 1 - i] = tmp;
     }
 
-    /*if (verbose) {
-        printf("\n--- Extending read (first 60 bases shown) ---\n");
-        printf("Original read (first 60): %.60s\n", read);
-        printf("Backward extension (%d bases): %s\n", begin_len, begin_ext);
-        printf("Forward extension (%d bases): %s\n", (int)strlen(end_ext), end_ext);
-        printf("---------------------------------------------------\n");
-    }*/
-
-    int total_len = begin_len + read_len + strlen(end_ext); // +1 for null terminator
+    int total_len = begin_len + read_len + strlen(end_ext);
     char *contig = malloc(total_len + 1);
     if (!contig) { perror("malloc"); free(begin_ext); free(end_ext); return NULL; }
-    strcpy(contig, begin_ext);   // copy backward extension first
-    strcat(contig, read);        // append original read
-    strcat(contig, end_ext);     // append forward extension
+    strcpy(contig, begin_ext);
+    strcat(contig, read);
+    strcat(contig, end_ext);
 
     free(begin_ext);
     free(end_ext);
@@ -392,220 +438,288 @@ char *extend_read(const char *read) {
     return contig;
 }
 
-read_pair get_read_to_extend(int total_seqs, int extended_count, int seq_id) {
 
-    if (total_seqs - extended_count <= 0) return (read_pair){0};
-
-    int rand_id = rand() % (total_seqs - extended_count); // random ID in the range of remaining sequences
-    int counter = 0;
-    read_pair reads;
-
-    while (counter < total_seqs) {
-        if (arr_forward[counter].used == 0) {
-            if (rand_id == 0) {
-                arr_forward[counter].used = 1; // mark as used
-                reads.forward_read = get_read_from_coordinates(arr_forward[counter].initial_position, arr_forward[counter].last_position, forward_file);
-                reads.reverse_read = get_read_from_coordinates(arr_reverse[counter].initial_position, arr_reverse[counter].last_position, reverse_file);
-                reads.valid = 1;
-                return reads;
-
-            }
-            rand_id--;
-        }
-        counter++;
-    }
-    return (read_pair){0}; // should not reach here if counts are correct
-
+void update_count() {
+    pthread_mutex_lock(&count_mutex);
+    seq_count++;
+    pthread_mutex_unlock(&count_mutex);
 }
 
-/**
- * Compute the Hamming distance between two strings of given length.
- * Stops early if the distance exceeds max_allowed.
- * Returns the distance (or a value > max_allowed if exceeded).
- */
-int hamming_distance_limit(const char *s1, const char *s2, int len, int max_allowed) {
-    int dist = 0;
-    for (int i = 0; i < len; i++) {
-        if (s1[i] != s2[i]) {
-            dist++;
-            if (dist > max_allowed) {
-                break;  // early exit, already too high
-            }
+void add_contig_to_list(char *contig) {
+    pthread_mutex_lock(&contig_mutex);
+    if (num_contigs >= contig_capacity) {
+        int new_capacity = contig_capacity == 0 ? 100 : contig_capacity * 2;
+        contig_info *new_list = realloc(list_contigs, new_capacity * sizeof(contig_info));
+        if (!new_list) {
+            perror("realloc");
+            exit(1);
         }
+        list_contigs = new_list;
+        contig_capacity = new_capacity;
     }
-    return dist;
+    list_contigs[num_contigs].contig = contig;
+    list_contigs[num_contigs].used = 0;
+    num_contigs++;
+    pthread_mutex_unlock(&contig_mutex);
 }
 
-void GenerateContigs(int number_sequences) {
-    int extended_count = 0;
-    while (extended_count < number_sequences) {
-        read_pair r = get_read_to_extend(number_sequences, extended_count, 0);
-        if (!r.valid) break;
+void *extend_all_reads(void *arg) {
+    thread_data_t *data = (thread_data_t*) arg;
+    int thread_id = data->thread_id;
+    int total_sequences = data->total_sequences;
+    int file_index = data->file_index;
 
-        int found_forward = 0;
-        for (int i = 0; i < num_contigs; ++i) {
-            if (contains_with_substitutions(list_contigs_found[i], r.forward_read, max_substitutions)) {
-                found_forward = 1;
-                break;
-            }
-        }
+    if (verbose) printf("Thread %d: Starting extension of single reads, file_index %d...\n", thread_id, file_index);
 
-        if (!found_forward) {
+    seq_info *arr1;
+    char *file1;
 
-            // Extend the read in both directions
-            char *extended_forward_read = extend_read(r.forward_read);
-            char *extended_reverse_read = extend_read(r.reverse_read);
+    seq_info *arr2 = NULL;
+    char *file2 = NULL;
 
-            // If either extension failed, we cannot use them.
-            if (!extended_forward_read || !extended_reverse_read) {
-                free(extended_forward_read);
-                free(extended_reverse_read);
-                free(r.forward_read);
-                free(r.reverse_read);
-                extended_count++;
-                continue;
-            }
+    switch (file_index) {
+        case 0:
+            arr1 = arr_forward;
+            file1 = forward_file;
+            break;
+        case 1:
+            arr1 = arr_reverse;
+            file1 = reverse_file;
+            break;
+        case 2:
+            arr1 = arr_additional;
+            file1 = additional_file;
+            break;
+        case 3:
+            arr1 = arr_forward;
+            file1 = forward_file;
+            arr2 = arr_reverse;
+            file2 = reverse_file;
+            break;
+        default:
+            printf("Invalid file index.\n");
+            exit(1);
+    }
 
-            // Try to merge the two extended reads
-            char *merged_contig = try_merge_two_contigs(
-                extended_forward_read, strlen(extended_forward_read),
-                extended_reverse_read, strlen(extended_reverse_read),
-                 max_substitutions, overlap_threshold);
-            
+    for (int i = 0; i < total_sequences; i++) {
+        if (i % number_of_threads != thread_id) continue;
 
-            // Decide which string to keep
-            char *contig_to_add = merged_contig ? merged_contig : extended_forward_read;
-            int substituted = 0;
+        update_count();
 
-            // Check if this contig replaces an existing one
-            if (num_contigs > 0) {
-                for (int i = 0; i < num_contigs && !substituted; ++i) {
-                    if (contains_with_substitutions(contig_to_add, list_contigs_found[i], max_substitutions)) {
-                        free(list_contigs_found[i]);          // free old contig
-                        list_contigs_found[i] = contig_to_add; // replace with new
-                        substituted = 1;
-                        if (verbose) {
-                            printf("Substituted contig %d with new contig of length %zu\n", i, strlen(contig_to_add));
-                        }
-                        break;
-                    }
+        char* read1 = get_read_from_coordinates(arr1[i].initial_position, arr1[i].last_position, file1);
+
+        if (file_index == 3) {
+            char* read2 = get_read_from_coordinates(arr2[i].initial_position, arr2[i].last_position, file2);
+
+            // For this merge, no substitutions are acceptable and the overlap should be at least 8
+            char *merged = try_merge_two_reads(read1, strlen(read1), read2, strlen(read2), 0.0, 8);
+
+            if (merged) {
+                printf("Thread %d: Merging paired-end reads of length %zu and %zu, id %d -> merged length %zu\n",
+                       thread_id, strlen(read1), strlen(read2), i+1, strlen(merged));
+                char *extended = extend_read(merged, i+1, "both files");
+
+                if (extended == NULL) {
+                    if (verbose) fprintf(stderr, "Thread %d: No extension possible for merged read of id %d, file %d\n", thread_id, i+1, file_index);
                 }
-            }
-
-            if (!substituted || num_contigs == 0) { // If not substituted, add as new contig
-                if (num_contigs >= contig_capacity) {
-                    contig_capacity += 1000;
-                    list_contigs_found = realloc(list_contigs_found, contig_capacity * sizeof(char*));
-                    if (!list_contigs_found) { perror("realloc"); exit(1); }
-                }
-                list_contigs_found[num_contigs++] = contig_to_add;
-                if (verbose) printf("Added contig of length %zu (total %d)\n", strlen(contig_to_add), num_contigs);
-            }
-
-            // Free the string that was NOT used
-            if (merged_contig) {
-                free(extended_forward_read);
-                free(extended_reverse_read);
+                if (extended) add_contig_to_list(extended);
+                free(merged);
             } else {
-                free(extended_reverse_read);
-                // extended_forward_read is now owned by contig_to_add
+                char *extended_read1 = extend_read(read1, i+1, file1);
+                if (extended_read1 == NULL) {
+                    if (verbose) fprintf(stderr, "Thread %d: No extension possible for merged read of id %d, file %d\n", thread_id, i+1, file_index);
+                }
+                char *extended_read2 = extend_read(read2, i+1, file2);
+                if (extended_read2 == NULL) {
+                    if (verbose) fprintf(stderr, "Thread %d: No extension possible for merged read of id %d, file %d\n", thread_id, i+1, file_index);
+                }
+                char *merged_extended = try_merge_two_reads(read1, strlen(read1), read2, strlen(read2), f_max_substitutions, min_overlap);
+                if (merged_extended) {
+                    add_contig_to_list(merged_extended);
+                    free(merged_extended);
+                } else {
+                    if (extended_read1) add_contig_to_list(extended_read1);
+                    if (extended_read2) add_contig_to_list(extended_read2);
+                }
             }
-        } else if (verbose) {
-            printf("Read already covered by existing contig\n");
+            free(read1);
+            free(read2);
+        } else {
+            char *extended = extend_read(read1, i+1, "smt else");
+            if (extended == NULL) {
+                if (verbose) fprintf(stderr, "Thread %d: No extension possible for read of id %d, file %d\n", thread_id, i+1, file_index);
+            }
+            if (extended) add_contig_to_list(extended);
+            free(read1);
         }
-
-        free(r.forward_read);
-        free(r.reverse_read);
-        extended_count++;
     }
+    return NULL;
 }
 
-// ======================================================================
-// Comparison function for qsort: sort by string length (ascending)
+void GenerateContigs(int file_index, int number_sequences) {
+    pthread_t threads[number_of_threads];
+    thread_data_t thread_data[number_of_threads];
+
+    for (int i = 0; i < number_of_threads; i++) {
+        if (verbose) printf("Main: Starting thread %d\n", i);
+        thread_data[i].thread_id = i;
+        thread_data[i].total_sequences = number_sequences;
+        thread_data[i].file_index = file_index;
+
+        if (pthread_create(&threads[i], NULL, extend_all_reads, &thread_data[i]) != 0) {
+            perror("Failed to create thread");
+            exit(1);
+        }
+    }
+    for (int i = 0; i < number_of_threads; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    printf("%d sequences processed - %d contigs generated\n", seq_count, num_contigs);
+    seq_count = 0;
+}
+
+// Comparison function for qsort: sort by length descending
 int compare_contig_len(const void *a, const void *b) {
-    const char *sa = *(const char **)a;
-    const char *sb = *(const char **)b;
-    size_t len_a = strlen(sa);
-    size_t len_b = strlen(sb);
+    const contig_info *ca = (const contig_info *)a;
+    const contig_info *cb = (const contig_info *)b;
+    size_t len_a = strlen(ca->contig);
+    size_t len_b = strlen(cb->contig);
     if (len_a < len_b) return 1;
     if (len_a > len_b) return -1;
     return 0;
+}
+
+void output_contigs(char **contigs, int num_contigs, int min_length) {
+    FILE *out = fopen(output_path, "a");
+    if (!out) {
+        perror("fopen output file");
+        exit(1);
+    }
+    for (int i = 0; i < num_contigs; ++i) {
+        size_t len = strlen(contigs[i]);
+        if (len < (size_t)min_length) continue;
+        //printf(">contig_%d (length %zu)\n%.60s\n", i+1, len, contigs[i]);
+        fprintf(out, ">contig_%d (length %zu)\n%s\n", i+1, len, contigs[i]);
+    }
+    fclose(out);
+}
+
+void fix_overlap_values () {
+
+    int avg_read_length = length_all_sequences / num_reads;
+
+    if (max_substitutions == -1) {
+        max_substitutions = f_max_substitutions * avg_read_length;
+    } else {
+        f_max_substitutions = (float) max_substitutions / avg_read_length;
+        printf("%f    --- val max subs\n\n", f_max_substitutions);
+    }
+
+    if (max_overlap == -1) {
+        max_overlap = f_max_overlap * avg_read_length;
+    }
+
+    if (min_overlap == -1) {
+        min_overlap = f_min_overlap * avg_read_length;
+    }
+
+    if (min_overlap > max_overlap) {
+        printf ("The minimum overlap is greater than the maximum overlap (Min overlap: %d  Max overlap:%d)\nExiting...\n", min_overlap, max_overlap);
+        exit(1);
+    }
+
 }
 
 // ======================================================================
 // Main
 // ======================================================================
 int main(int argc, char *argv[]) {
-
     srand(time(NULL));
 
-    // Menu and option parsing
     int rc = option_parsing(argc, argv);
     if (rc != 0) exit(rc);
     if (help_menu) exit(0);
 
-    //Allocate sequence info array  - storing initial and last positions of each sequence in the FASTQ file
+    if (access(forward_file, F_OK) != 0 || access(reverse_file, F_OK) != 0) {
+        printf("Error: invalid input. Exiting...\n");
+        exit(1);
+    }
+    if (additional_file && access(additional_file, F_OK) != 0) {
+        printf("Error: invalid additional file. Exiting...\n");
+        exit(1);
+    }
+
+    printf("Input files: %s, %s%s%s\n", forward_file, reverse_file,
+           additional_file ? ", " : "", additional_file ? additional_file : "");
+    printf("Training model with context size %d...\n", context_size);
+    printf("Running with %d thread(s)...\n", number_of_threads);
+    printf("Output path: %s\n", output_path);
+    printf("Minimum length for output contigs: %d\n", min_length);
+    printf("==============================\n");
+
     arr_forward = malloc(capacity * sizeof(seq_info));
     if (!arr_forward) { perror("malloc"); exit(1); }
     arr_reverse = malloc(capacity * sizeof(seq_info));
     if (!arr_reverse) { perror("malloc"); exit(1); }
-
-
-    if (access(forward_file, F_OK) != 0) {
-        printf("Error: forward file does not exist.\n");
-        exit(1);
-    }
-    if (access(reverse_file, F_OK) != 0) {
-        printf("Error: reverse file does not exist.\n");
-        exit(1);
+    if (additional_file) {
+        arr_additional = malloc(capacity * sizeof(seq_info));
+        if (!arr_additional) { perror("malloc"); exit(1); }
     }
 
-    printf("Running with %d thread(s)...\n", number_of_threads);
-    printf("Training model with context size %d...\n", context_size);
-
-    // Create hash table and train model on input FASTQ files
+    printf("\n---Training model---\n");
     hm = CreateHashTable();
-    train_model(forward_file, arr_forward);
-    train_model(reverse_file, arr_reverse);
+
+    int max_id_forward = train_model(forward_file, arr_forward);
+    int max_id_reverse = train_model(reverse_file, arr_reverse);
+    int max_id_additional = 0;
+    if (additional_file) {
+        max_id_additional = train_model(additional_file, arr_additional);
+    }
+
+    fix_overlap_values();
+
+    printf("Max substitutions for merging: %d\n", max_substitutions);
+    printf("Minimum overlap for merging contigs: %d\n", min_overlap);
+    printf("Max overlap for merging: %d\n", max_overlap);
 
     printf("\n--- Generating contigs ---\n");
-    GenerateContigs(last_sequence_id);
-
-    printf("\n--- Sort contigs by length ---\n");
-
-    qsort(list_contigs_found, num_contigs, sizeof(char *), compare_contig_len);
-
-
-
-    // Merge similar/overlapping contigs
-    printf("\n--- Merging contigs ---\n");
-    int merges_done;
-    do {
-        merges_done = merge_contigs();
-
-        if (merges_done < 0) {
-            fprintf(stderr, "Error during merging contigs.\n");
-            break;
-        } else {
-            if (verbose) printf("Merged %d pairs, %d contigs remaining\n", merges_done, num_contigs);
-        }
-    } while (merges_done > 0);
-
-    int total_contigs = num_contigs; // store total before output
-
-    // Output final contigs
-    printf("\n=== Final Contigs ===\n");
-    for (int i = 0; i < num_contigs; ++i) {
-        //printf(">contig_%d (length %zu)\n%s\n", i+1, strlen(list_contigs_found[i]), list_contigs_found[i]);
-        free(list_contigs_found[i]);
+    char error_msg[256];
+    int sync_result = check_paired_end_files(forward_file, reverse_file, error_msg, sizeof(error_msg));
+    if (sync_result == 0) {
+        printf("Paired-end files are synchronized.\n");
+        GenerateContigs(3, max_id_forward);
+    } else {
+        fprintf(stderr, "Warning: Paired-end files are not synchronized. Reason: %s\nProceeding with reconstruction treating them as independent files.\n", error_msg);
+        GenerateContigs(0, max_id_forward);
+        GenerateContigs(1, max_id_reverse);
     }
-    free(list_contigs_found);
 
-    printf("\nTotal contigs: %d     %d\n", total_contigs, num_contigs);
+    if (additional_file) {
+        printf("\n--- Processing additional file ---\n");
+        GenerateContigs(2, max_id_additional);
+    }
 
+    // Sort contigs by length descending (optional, uncomment if needed)
+    // qsort(list_contigs, num_contigs, sizeof(contig_info), compare_contig_len);
+
+    printf("\n--- Merging contigs ---\n");
+    int total_contigs = num_contigs;
+    contig_array merges_done = merge_contigs(number_of_threads, total_contigs);
+
+
+    printf("\n=== Final Contigs ===\n");
+    qsort(merges_done.final_contigs, merges_done.number_contigs, sizeof(char*), compare_contig_len);
+
+    printf("Total contigs after merging: %d\n", merges_done.number_contigs);
+    output_contigs(merges_done.final_contigs, merges_done.number_contigs, min_length);
+
+    // Clean up
+
+    free(list_contigs);
     RemoveHashTable(hm);
     free(arr_forward);
     free(arr_reverse);
+    if (additional_file) free(arr_additional);
     printf("Done.\n");
     return 0;
 }
