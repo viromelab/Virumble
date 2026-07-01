@@ -12,7 +12,7 @@
 // ----------------------------------------------------------------------
 // Global options (definitions)
 // ----------------------------------------------------------------------
-int number_of_threads = 1;
+int number_threads = 1;
 
 char *forward_file = NULL;
 char *reverse_file = NULL;
@@ -39,6 +39,10 @@ int length_all_sequences = 0;
 int avg_read_length = 0;
 
 
+// count_mutex is kept declared for header/ABI compatibility with any other
+// translation units that may reference it, but seq_count is now updated via
+// an atomic increment (see update_count()) instead of this mutex, since a
+// full lock/unlock pair per read was pure overhead for a simple counter.
 pthread_mutex_t count_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t contig_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -58,6 +62,7 @@ float f_min_overlap = 0.1;
 contig_info *list_contigs = NULL;        // dynamic list of contigs
 int num_contigs = 0;                     // number of contigs stored
 int contig_capacity = 0;                 // allocated size
+float f_max_substitutions_dedup = 0.1;  // strict threshold for containment/dedup filtering only
 
 // ----------------------------------------------------------------------
 // Command line options
@@ -72,6 +77,8 @@ static struct option long_options[] = {
     {"substitutions", required_argument, 0, 's'},
     {"max_overlap", required_argument, 0, 'M'},
     {"min_overlap", required_argument, 0, 'm'},
+    {"length", required_argument, 0, 'l'},
+    {"deduplication", required_argument, 0, 'd'},
     {"threads", required_argument, 0, 't'},
     {"verbose", no_argument, 0, 'v'},
     {0, 0, 0, 0}
@@ -93,6 +100,7 @@ void program_usage(const char *prog) {
     printf("  -M, --max_overlap N     Maximum overlap for merging contigs (can be set as the number of bases or as a percentage of the average read length)\n");
     printf("  -m, --min_overlap N     Minimum overlap for merging contigs (can be set as the number of bases or as a percentage of the average read length)\n");
     printf("  -l, --length N          Minimum length for output contigs (default: 0)\n");
+    printf("  -d, --deduplication N   Deduplication factor (default 0.1)\n");
     printf("  -t, --threads N         Number of threads (default: 1)\n");
     printf("  -v, --verbose           Verbose output\n\n");
     help_menu = 1;
@@ -107,7 +115,7 @@ int option_parsing(int argc, char *argv[]) {
         program_usage(argv[0]);
         return 0;
     }
-    while ((opt = getopt_long(argc, argv, "hf:r:a:o:c:s:M:m:l:t:v", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "hf:r:a:o:c:s:M:m:l:d:t:v", long_options, NULL)) != -1) {
         switch (opt) {
             case 'h': program_usage(argv[0]); return 0;
             case 'f': forward_file = optarg; break;
@@ -160,7 +168,8 @@ int option_parsing(int argc, char *argv[]) {
             }
 
             case 'l': min_length = atoi(optarg); break;
-            case 't': number_of_threads = atoi(optarg); break;
+            case 'd': f_max_substitutions_dedup = atof(optarg); break;
+            case 't': number_threads = atoi(optarg); break;
             case 'v': verbose = 1; break;
 
             default:  program_usage(argv[0]); return 1;
@@ -349,7 +358,7 @@ char *generate_sequence(const char *start_kmer, int forward) {
         context[context_size - 1] = '\0';
     }
 
-    int max_len = 4096;
+    int max_len = 10000;
     char *sequence = malloc(max_len + 1);
     if (!sequence) { perror("malloc"); exit(1); }
     sequence[0] = '\0';
@@ -378,16 +387,27 @@ char *generate_sequence(const char *start_kmer, int forward) {
     return sequence;
 }
 
-char *get_read_from_coordinates(long begin, long end, char *input_file) {
-    FILE *f = fopen(input_file, "rb");
-    if (!f) {
-        perror("fopen in get_read_from_coordinates");
+// ----------------------------------------------------------------------
+// Reads a sequence from an ALREADY-OPEN file handle at given byte offsets,
+// stripping newlines and '+' characters. Does NOT open or close the file --
+// the caller owns the FILE* and manages its lifetime.
+//
+// This exists to avoid the fopen/fclose overhead of get_read_from_coordinates
+// when called repeatedly (e.g. once per read, potentially millions of times)
+// against the same file -- that per-call open/close was previously the
+// dominant I/O cost of the whole pipeline.
+// ----------------------------------------------------------------------
+char *get_read_from_open_file(FILE *f, long begin, long end) {
+    if (!f) return NULL;
+    if (fseek(f, begin, SEEK_SET) != 0) {
+        perror("fseek in get_read_from_open_file");
         return NULL;
     }
-    fseek(f, begin, SEEK_SET);
     long len = end - begin + 1;
+    if (len <= 0) return NULL;
+
     char *read = malloc(len + 1);
-    if (!read) { perror("malloc"); fclose(f); return NULL; }
+    if (!read) { perror("malloc"); return NULL; }
     size_t n = fread(read, 1, len, f);
     read[n] = '\0';
 
@@ -397,8 +417,21 @@ char *get_read_from_coordinates(long begin, long end, char *input_file) {
         src++;
     }
     *dst = '\0';
-    fclose(f);
     return read;
+}
+
+// Original single-call convenience wrapper, kept for any other callers that
+// only need one read from a file and don't want to manage a FILE* themselves.
+// Implemented in terms of get_read_from_open_file to avoid duplicating logic.
+char *get_read_from_coordinates(long begin, long end, char *input_file) {
+    FILE *f = fopen(input_file, "rb");
+    if (!f) {
+        perror("fopen in get_read_from_coordinates");
+        return NULL;
+    }
+    char *result = get_read_from_open_file(f, begin, end);
+    fclose(f);
+    return result;
 }
 
 char *extend_read(const char *read, int read_id, char *input_file) {
@@ -439,16 +472,57 @@ char *extend_read(const char *read, int read_id, char *input_file) {
 }
 
 
+// seq_count is now updated with an atomic add instead of a mutex-guarded
+// increment -- a full lock/unlock pair per read was pure overhead for what
+// is just a counter, and this loop runs once per read across all threads.
 void update_count() {
-    pthread_mutex_lock(&count_mutex);
-    seq_count++;
-    pthread_mutex_unlock(&count_mutex);
+    __atomic_fetch_add(&seq_count, 1, __ATOMIC_RELAXED);
 }
 
+// ----------------------------------------------------------------------
+// Reserve capacity in list_contigs ahead of time so that add_contig_to_list
+// can use a lock-free fast path (a single atomic index increment) instead of
+// taking contig_mutex on every insertion. Safe to call before spawning the
+// worker threads for a given GenerateContigs() batch.
+// ----------------------------------------------------------------------
+void reserve_contig_capacity(int extra) {
+    if (extra <= 0) return;
+    int needed = num_contigs + extra;
+    if (needed <= contig_capacity) return;
+
+    int new_capacity = contig_capacity == 0 ? 100 : contig_capacity;
+    while (new_capacity < needed) new_capacity *= 2;
+
+    contig_info *new_list = realloc(list_contigs, new_capacity * sizeof(contig_info));
+    if (!new_list) {
+        perror("realloc in reserve_contig_capacity");
+        exit(1);
+    }
+    list_contigs = new_list;
+    contig_capacity = new_capacity;
+}
+
+// ----------------------------------------------------------------------
+// Add a contig to the global list. Fast path: capacity was already reserved
+// (see reserve_contig_capacity), so we can claim a slot with a single atomic
+// increment and write into it without any locking. Fallback path: if the
+// reserved capacity was somehow underestimated, fall back to the original
+// locked realloc-and-grow behaviour.
+// ----------------------------------------------------------------------
 void add_contig_to_list(char *contig) {
+    int idx = __atomic_fetch_add(&num_contigs, 1, __ATOMIC_RELAXED);
+
+    if (idx < contig_capacity) {
+        list_contigs[idx].contig = contig;
+        list_contigs[idx].used   = 0;
+        return;
+    }
+
+    // Fallback: capacity was insufficient, serialize growth.
     pthread_mutex_lock(&contig_mutex);
-    if (num_contigs >= contig_capacity) {
+    if (idx >= contig_capacity) {
         int new_capacity = contig_capacity == 0 ? 100 : contig_capacity * 2;
+        while (new_capacity <= idx) new_capacity *= 2;
         contig_info *new_list = realloc(list_contigs, new_capacity * sizeof(contig_info));
         if (!new_list) {
             perror("realloc");
@@ -457,9 +531,8 @@ void add_contig_to_list(char *contig) {
         list_contigs = new_list;
         contig_capacity = new_capacity;
     }
-    list_contigs[num_contigs].contig = contig;
-    list_contigs[num_contigs].used = 0;
-    num_contigs++;
+    list_contigs[idx].contig = contig;
+    list_contigs[idx].used   = 0;
     pthread_mutex_unlock(&contig_mutex);
 }
 
@@ -501,15 +574,26 @@ void *extend_all_reads(void *arg) {
             exit(1);
     }
 
+    // Open each needed file ONCE per thread instead of once per read. This is
+    // the single biggest execution-time fix in this file: with potentially
+    // millions of reads, fopen/fclose per read dominates total runtime.
+    FILE *fp1 = fopen(file1, "rb");
+    if (!fp1) { perror("fopen file1 in extend_all_reads"); exit(1); }
+    FILE *fp2 = NULL;
+    if (file2) {
+        fp2 = fopen(file2, "rb");
+        if (!fp2) { perror("fopen file2 in extend_all_reads"); fclose(fp1); exit(1); }
+    }
+
     for (int i = 0; i < total_sequences; i++) {
-        if (i % number_of_threads != thread_id) continue;
+        if (i % number_threads != thread_id) continue;
 
         update_count();
 
-        char* read1 = get_read_from_coordinates(arr1[i].initial_position, arr1[i].last_position, file1);
+        char* read1 = get_read_from_open_file(fp1, arr1[i].initial_position, arr1[i].last_position);
 
         if (file_index == 3) {
-            char* read2 = get_read_from_coordinates(arr2[i].initial_position, arr2[i].last_position, file2);
+            char* read2 = get_read_from_open_file(fp2, arr2[i].initial_position, arr2[i].last_position);
 
             // For this merge, no substitutions are acceptable and the overlap should be at least 8
             char *merged = try_merge_two_reads(read1, strlen(read1), read2, strlen(read2), 0.0, 8);
@@ -538,8 +622,17 @@ void *extend_all_reads(void *arg) {
                     add_contig_to_list(merged_extended);
                     free(merged_extended);
                 } else {
-                    if (extended_read1) add_contig_to_list(extended_read1);
-                    if (extended_read2) add_contig_to_list(extended_read2);
+                    if (extended_read1) {
+                        add_contig_to_list(extended_read1);
+                    } else {
+                        add_contig_to_list(read1);
+                    }
+
+                    if (extended_read2) {
+                        add_contig_to_list(extended_read2);
+                    } else {
+                        add_contig_to_list(read2);
+                    }
                 }
             }
             free(read1);
@@ -553,14 +646,26 @@ void *extend_all_reads(void *arg) {
             free(read1);
         }
     }
+
+    fclose(fp1);
+    if (fp2) fclose(fp2);
+
     return NULL;
 }
 
 void GenerateContigs(int file_index, int number_sequences) {
-    pthread_t threads[number_of_threads];
-    thread_data_t thread_data[number_of_threads];
+    // Upper bound on how many contigs this batch can add: paired-file mode
+    // (file_index == 3) can add up to 2 contigs per sequence (one per read
+    // when no merge/extension succeeds), everything else adds at most 1.
+    // Reserving this up front lets add_contig_to_list use a lock-free fast
+    // path instead of taking contig_mutex on every single insertion.
+    int max_new_contigs = (file_index == 3) ? number_sequences * 2 : number_sequences;
+    reserve_contig_capacity(max_new_contigs);
 
-    for (int i = 0; i < number_of_threads; i++) {
+    pthread_t threads[number_threads];
+    thread_data_t thread_data[number_threads];
+
+    for (int i = 0; i < number_threads; i++) {
         if (verbose) printf("Main: Starting thread %d\n", i);
         thread_data[i].thread_id = i;
         thread_data[i].total_sequences = number_sequences;
@@ -571,7 +676,7 @@ void GenerateContigs(int file_index, int number_sequences) {
             exit(1);
         }
     }
-    for (int i = 0; i < number_of_threads; i++) {
+    for (int i = 0; i < number_threads; i++) {
         pthread_join(threads[i], NULL);
     }
     printf("%d sequences processed - %d contigs generated\n", seq_count, num_contigs);
@@ -652,7 +757,7 @@ int main(int argc, char *argv[]) {
     printf("Input files: %s, %s%s%s\n", forward_file, reverse_file,
            additional_file ? ", " : "", additional_file ? additional_file : "");
     printf("Training model with context size %d...\n", context_size);
-    printf("Running with %d thread(s)...\n", number_of_threads);
+    printf("Running with %d thread(s)...\n", number_threads);
     printf("Output path: %s\n", output_path);
     printf("Minimum length for output contigs: %d\n", min_length);
     printf("==============================\n");
@@ -704,7 +809,7 @@ int main(int argc, char *argv[]) {
 
     printf("\n--- Merging contigs ---\n");
     int total_contigs = num_contigs;
-    contig_array merges_done = merge_contigs(number_of_threads, total_contigs);
+    contig_array merges_done = merge_contigs(number_threads, total_contigs);
 
 
     printf("\n=== Final Contigs ===\n");

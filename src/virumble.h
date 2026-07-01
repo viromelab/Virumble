@@ -55,7 +55,7 @@ typedef struct {
 // ----------------------------------------------------------------------
 // Global variables (extern, defined in virumble.c)
 // ----------------------------------------------------------------------
-extern int number_of_threads;
+extern int number_threads;
 extern char *forward_file;
 extern char *reverse_file;
 extern char *additional_file;

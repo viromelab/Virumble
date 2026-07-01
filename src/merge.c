@@ -17,6 +17,8 @@ extern contig_info *list_contigs; // array of input contigs (each with a string 
 extern int min_overlap;     // minimum overlap length required to consider a merge
 extern int number_threads;        // number of parallel threads to use
 extern int max_overlap;           // maximum overlap length to consider (0 = no limit)
+extern float f_max_substitutions_dedup;
+extern int min_length;            // minimum length of contigs to output
 
 pthread_mutex_t merge_mutex = PTHREAD_MUTEX_INITIALIZER; // protects the global merge list
 
@@ -523,33 +525,89 @@ static char *msa_consensus(char **seqs, int n,
 }
 
 // =============================================================================
-// filter_contained_contigs
+// filter_contained_contigs (parallelized)
 // =============================================================================
-// Remove sequences that are exact substrings of another (longer) sequence in the list.
+// Remove sequences that are near-duplicates / substrings of another (longer) sequence
+// in the list, allowing up to f_max_substitutions_dedup mismatches. Contigs shorter
+// than min_length are skipped entirely (neither compared as a candidate nor removed).
 // Returns a new array of unique, non‑contained sequences.
+
+// ---------- Thread data for parallel containment filtering ----------
+typedef struct {
+    int thread_id;
+    int number_threads;
+    int count;
+    char **contigs;
+    int *lengths;
+    int *is_contained;
+} contain_thread_data_t;
+
+static void *filter_contained_worker(void *arg) {
+    contain_thread_data_t *data = (contain_thread_data_t *)arg;
+    int thread_id     = data->thread_id;
+    int nt            = data->number_threads;
+    int count         = data->count;
+    char **contigs    = data->contigs;
+    int *lengths      = data->lengths;
+    int *is_contained = data->is_contained;
+
+    // Partition unordered pairs (i < j) across threads by i, so each pair is
+    // examined exactly once instead of twice (i,j) and (j,i).
+    for (int i = thread_id; i < count; i += nt) {
+        int li = lengths[i];
+        if (li < min_length) continue;
+
+        for (int j = i + 1; j < count; j++) {
+            int lj = lengths[j];
+            if (lj < min_length) continue;
+
+            if (li == lj) {
+                int max_subs = (int)(f_max_substitutions_dedup * li);
+                if (hamming_distance_limit(contigs[i], contigs[j], li, max_subs) <= max_subs) {
+                    // Same length + near-identical: mark the later index as the duplicate.
+                    __atomic_store_n(&is_contained[j], 1, __ATOMIC_RELAXED);
+                }
+                continue;
+            }
+
+            const char *longer, *shorter;
+            int shorter_len, *mark_idx;
+            if (li > lj) { longer = contigs[i]; shorter = contigs[j]; shorter_len = lj; mark_idx = &is_contained[j]; }
+            else         { longer = contigs[j]; shorter = contigs[i]; shorter_len = li; mark_idx = &is_contained[i]; }
+
+            int max_subs = (int)(f_max_substitutions_dedup * shorter_len);
+            if (contains_with_substitutions(longer, shorter, max_subs)) {
+                __atomic_store_n(mark_idx, 1, __ATOMIC_RELAXED);
+            }
+        }
+    }
+    return NULL;
+}
+
 char **filter_contained_contigs(char **contigs, int count, int *new_count) {
     if (count == 0) { *new_count = 0; return NULL; }
 
     int *is_contained = (int *)calloc(count, sizeof(int));
-    if (!is_contained) return NULL;
+    int *lengths       = (int *)malloc(count * sizeof(int));
+    if (!is_contained || !lengths) { free(is_contained); free(lengths); return NULL; }
+    for (int i = 0; i < count; i++) lengths[i] = (int)strlen(contigs[i]); // cache once
 
-    for (int i = 0; i < count; i++) {
-        if (is_contained[i]) continue;
-        for (int j = 0; j < count; j++) {
-            if (i == j) continue;
-            int li = (int)strlen(contigs[i]), lj = (int)strlen(contigs[j]);
-            if (li == lj) {
-                if (strcmp(contigs[i], contigs[j]) == 0) is_contained[j] = 1;
-                continue;
-            }
-            const char *longer  = (li > lj) ? contigs[i] : contigs[j];
-            const char *shorter = (li > lj) ? contigs[j] : contigs[i];
-            if (strstr(longer, shorter)) {
-                if (li > lj) is_contained[j] = 1;
-                else         is_contained[i] = 1;
-            }
-        }
+    int nt = number_threads > 0 ? number_threads : 1;
+    if (nt > count) nt = count;
+    if (nt < 1) nt = 1;
+
+    pthread_t threads[nt];
+    contain_thread_data_t tdata[nt];
+    for (int t = 0; t < nt; t++) {
+        tdata[t] = (contain_thread_data_t){
+            .thread_id = t, .number_threads = nt, .count = count,
+            .contigs = contigs, .lengths = lengths, .is_contained = is_contained
+        };
+        pthread_create(&threads[t], NULL, filter_contained_worker, &tdata[t]);
     }
+    for (int t = 0; t < nt; t++) pthread_join(threads[t], NULL);
+
+    free(lengths);
 
     *new_count = 0;
     for (int i = 0; i < count; i++) if (!is_contained[i]) (*new_count)++;
@@ -570,6 +628,71 @@ char **filter_contained_contigs(char **contigs, int count, int *new_count) {
     }
     free(is_contained);
     return filtered;
+}
+
+// =============================================================================
+// Parallel per-component MSA worker (used in merge_contigs Phase 3)
+// =============================================================================
+typedef struct {
+    int thread_id;
+    int number_threads;
+    int nroots;
+    int n;
+    int *roots;
+    int *comp_of;
+    merge_info *merges_arr;
+    int nmerges_arr;
+    char **consensi;   // output slots, one per root index r (NULL if none produced)
+} msa_thread_data_t;
+
+static void *msa_worker(void *arg) {
+    msa_thread_data_t *data = (msa_thread_data_t *)arg;
+    int thread_id = data->thread_id;
+    int nt        = data->number_threads;
+
+    for (int r = thread_id; r < data->nroots; r += nt) {
+        int root = data->roots[r];
+
+        // Collect indices of all contigs belonging to this component
+        int mem_cap = 8, mem_cnt = 0;
+        int *members = (int *)malloc(mem_cap * sizeof(int));
+        if (!members) continue;
+        for (int i = 0; i < data->n; i++) {
+            if (data->comp_of[i] != root) continue;
+            if (mem_cnt == mem_cap) {
+                mem_cap *= 2;
+                int *tmp = (int *)realloc(members, mem_cap * sizeof(int));
+                if (!tmp) break;
+                members = tmp;
+            }
+            members[mem_cnt++] = i;
+        }
+        if (mem_cnt == 0) { free(members); continue; }
+
+        // Build an array of sequence strings for this component
+        char **comp_seqs = (char **)malloc(mem_cnt * sizeof(char *));
+        if (!comp_seqs) { free(members); continue; }
+        for (int k = 0; k < mem_cnt; k++) comp_seqs[k] = list_contigs[members[k]].contig;
+
+        if (verbose)
+            printf("Thread %d: component root=%d: %d sequences -> running MSA\n",
+                   thread_id, root, mem_cnt);
+
+        // Compute consensus for this component using MSA (each thread only ever
+        // touches its own comp_seqs/members and writes to its own consensi[r] slot,
+        // so no locking is required here)
+        char *cons = msa_consensus(comp_seqs, mem_cnt, data->merges_arr, data->nmerges_arr, members);
+        free(comp_seqs);
+        free(members);
+
+        if (cons && strlen(cons) > 0) {
+            data->consensi[r] = cons;
+        } else {
+            data->consensi[r] = NULL;
+            free(cons);
+        }
+    }
+    return NULL;
 }
 
 // =============================================================================
@@ -673,54 +796,49 @@ contig_array merge_contigs(int number_threads, int number_sequences) {
     }
     if (verbose) printf("Connected components: %d\n", nroots);
 
-    // ---- Phase 3: MSA per component -> consensus ----
-    char **consensi  = (char **)malloc(nroots * sizeof(char *));
-    int   cons_count = 0;
-    if (!consensi) {
+    // ---- Phase 3: MSA per component -> consensus (parallelized across components) ----
+    char **consensi_slots = (char **)calloc(nroots, sizeof(char *)); // one slot per root, NULL if empty
+    if (!consensi_slots) {
         free(parent); free(rank_uf); free(comp_of); free(roots);
         free(merge_possibilities); merge_possibilities = NULL;
         return (contig_array){NULL, 0};
     }
 
-    for (int r = 0; r < nroots; r++) {
-        int root = roots[r];
+    int nt_msa = number_threads > 0 ? number_threads : 1;
+    if (nt_msa > nroots) nt_msa = nroots > 0 ? nroots : 1;
+    if (nt_msa < 1) nt_msa = 1;
 
-        // Collect indices of all contigs belonging to this component
-        int mem_cap = 8, mem_cnt = 0;
-        int *members = (int *)malloc(mem_cap * sizeof(int));
-        if (!members) continue;
-        for (int i = 0; i < n; i++) {
-            if (comp_of[i] != root) continue;
-            if (mem_cnt == mem_cap) {
-                mem_cap *= 2;
-                members = (int *)realloc(members, mem_cap * sizeof(int));
-                if (!members) break;
-            }
-            members[mem_cnt++] = i;
-        }
-        if (mem_cnt == 0) { free(members); continue; }
-
-        // Build an array of sequence strings for this component
-        char **comp_seqs = (char **)malloc(mem_cnt * sizeof(char *));
-        if (!comp_seqs) { free(members); continue; }
-        for (int k = 0; k < mem_cnt; k++) comp_seqs[k] = list_contigs[members[k]].contig;
-
-        if (verbose)
-            printf("Component root=%d: %d sequences -> running MSA\n", root, mem_cnt);
-
-        // Compute consensus for this component using MSA
-        char *cons = msa_consensus(comp_seqs, mem_cnt, merge_possibilities, nmp, members);
-        free(comp_seqs);
-        free(members);
-
-        if (cons && strlen(cons) > 0) consensi[cons_count++] = cons;
-        else free(cons);
+    pthread_t msa_threads[nt_msa];
+    msa_thread_data_t msa_tdata[nt_msa];
+    for (int t = 0; t < nt_msa; t++) {
+        msa_tdata[t] = (msa_thread_data_t){
+            .thread_id = t, .number_threads = nt_msa, .nroots = nroots, .n = n,
+            .roots = roots, .comp_of = comp_of,
+            .merges_arr = merge_possibilities, .nmerges_arr = nmp,
+            .consensi = consensi_slots
+        };
+        pthread_create(&msa_threads[t], NULL, msa_worker, &msa_tdata[t]);
     }
+    for (int t = 0; t < nt_msa; t++) pthread_join(msa_threads[t], NULL);
+
+    char **consensi  = (char **)malloc(nroots * sizeof(char *));
+    int   cons_count = 0;
+    if (!consensi) {
+        for (int r = 0; r < nroots; r++) free(consensi_slots[r]);
+        free(consensi_slots);
+        free(parent); free(rank_uf); free(comp_of); free(roots);
+        free(merge_possibilities); merge_possibilities = NULL;
+        return (contig_array){NULL, 0};
+    }
+    for (int r = 0; r < nroots; r++) {
+        if (consensi_slots[r]) consensi[cons_count++] = consensi_slots[r];
+    }
+    free(consensi_slots);
 
     free(parent); free(rank_uf); free(comp_of); free(roots);
     free(merge_possibilities); merge_possibilities = NULL;
 
-    // ---- Phase 4: filter contained contigs (remove substrings) ----
+    // ---- Phase 4: filter contained contigs (remove substrings, parallelized) ----
     int   filtered_count = 0;
     char **filtered = filter_contained_contigs(consensi, cons_count, &filtered_count);
     for (int i = 0; i < cons_count; i++) free(consensi[i]);
@@ -769,6 +887,3 @@ char *try_merge_two_reads(char *a, int len_a, char *b, int len_b, float perc_max
     }
     return NULL;
 }
-
-
-
