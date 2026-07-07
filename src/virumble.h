@@ -20,8 +20,8 @@
 // ----------------------------------------------------------------------
 typedef struct {
     short int used;
-    long initial_position;
-    long last_position;
+    unsigned long long initial_position;
+    unsigned long long last_position;
 } seq_info;
 
 typedef struct {
@@ -86,11 +86,11 @@ void program_usage(const char *prog);
 int option_parsing(int argc, char *argv[]);
 void IncrementKmer(const char *kmer);
 seq_info *expand_seq_info(seq_info *arr, size_t current_capacity, size_t extra);
-void save_position(int id, long initial_position, long last_pos, seq_info *arr);
-int train_model(char *file_name, seq_info *arr);
+seq_info* save_position(int id, unsigned long long initial_position, unsigned long long last_pos, seq_info *arr, size_t *arr_capacity);
+int train_model(char *file_name, seq_info **arr_ptr, size_t *cap_ptr);
 char generate_next_symbol(const char *context, int forward);
 char *generate_sequence(const char *start_kmer, int forward);
-char *get_read_from_coordinates(long begin, long end, char *input_file);
+char *get_read_from_coordinates(unsigned long long begin, unsigned long long end, char *input_file);
 char *extend_read(const char *read, int read_id, char *input_file);
 read_pair get_read_to_extend(int total_seqs, int extended_count, int seq_id);
 int hamming_distance_limit(const char *s1, const char *s2, int len, int max_allowed);

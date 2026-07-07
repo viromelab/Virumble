@@ -24,7 +24,7 @@ int context_size;
 int verbose = 0;
 int help_menu = 0;
 
-size_t capacity = 10000;  // initial capacity for sequence info array
+// REMOVED: size_t capacity = 10000;  // no longer a single global capacity
 seq_info *arr_forward;
 seq_info *arr_reverse;
 seq_info *arr_additional; // only used if additional file is provided
@@ -221,23 +221,31 @@ seq_info *expand_seq_info(seq_info *arr, size_t current_capacity, size_t extra) 
     return new_arr;
 }
 
-void save_position(int id, long initial_position, long last_pos, seq_info *arr) {
+// CHANGED: save_position now takes a pointer to capacity (per‑file) and returns the
+// (possibly updated) array pointer so the caller can use it.
+seq_info *save_position(int id, unsigned long long initial_position,
+                        unsigned long long last_pos, seq_info *arr,
+                        size_t *arr_capacity) {
     if (verbose)
-        printf("Saving position for sequence %d: initial=%ld, last=%ld\n",
+        printf("Saving position for sequence %d: initial=%lld, last=%lld\n",
                id, initial_position, last_pos);
-    if (id >= (int)capacity) {
-        arr = expand_seq_info(arr, capacity, 200);
-        capacity += 200;
+    if ((size_t)id >= *arr_capacity) {
+        arr = expand_seq_info(arr, *arr_capacity, 200);
+        *arr_capacity += 200;
     }
     arr[id].initial_position = initial_position;
     arr[id].last_position = last_pos;
     arr[id].used = 0;
+    return arr;
 }
 
 // ----------------------------------------------------------------------
 // Model training: read FASTQ, extract all kmers, update hash table
+// CHANGED: train_model now receives a pointer to the array pointer and a
+// pointer to the capacity, so it can update the caller's variables when
+// reallocation happens.
 // ----------------------------------------------------------------------
-int train_model(char *file_name, seq_info *arr) {
+int train_model(char *file_name, seq_info **arr_ptr, size_t *cap_ptr) {
     FILE *file = fopen(file_name, "rb");
     if (!file) {
         perror("fopen");
@@ -259,13 +267,17 @@ int train_model(char *file_name, seq_info *arr) {
     int full_slots = 0;
     int length_sequences_curr_file = 0;
 
+    // Use local copies of the pointer and capacity for the duration of this function
+    seq_info *arr = *arr_ptr;
+    size_t capacity = *cap_ptr;
+
     while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, file)) > 0) {
         for (size_t idx = 0; idx < bytes_read; ++idx) {
             char ch = buffer[idx];
 
             if (ch == '@') {
                 if (id >= 0)
-                    save_position(id, initial_position, last_pos, arr);
+                    arr = save_position(id, initial_position, last_pos, arr, &capacity);
                 //Reset values
                 part_sequence = 0;
                 ring_pos = 0;
@@ -301,13 +313,17 @@ int train_model(char *file_name, seq_info *arr) {
         }
     }
     if (id >= 0)
-        save_position(id, initial_position, last_pos, arr);
+        arr = save_position(id, initial_position, last_pos, arr, &capacity);
 
     free(kmer_ring);
     fclose(file);
 
     num_reads += id + 1;
     length_all_sequences += length_sequences_curr_file;
+
+    // Update the caller's pointer and capacity
+    *arr_ptr = arr;
+    *cap_ptr = capacity;
 
     return id;
 }
@@ -423,7 +439,7 @@ char *get_read_from_open_file(FILE *f, long begin, long end) {
 // Original single-call convenience wrapper, kept for any other callers that
 // only need one read from a file and don't want to manage a FILE* themselves.
 // Implemented in terms of get_read_from_open_file to avoid duplicating logic.
-char *get_read_from_coordinates(long begin, long end, char *input_file) {
+char *get_read_from_coordinates(unsigned long long begin, unsigned long long end, char *input_file) {
     FILE *f = fopen(input_file, "rb");
     if (!f) {
         perror("fopen in get_read_from_coordinates");
@@ -762,23 +778,27 @@ int main(int argc, char *argv[]) {
     printf("Minimum length for output contigs: %d\n", min_length);
     printf("==============================\n");
 
-    arr_forward = malloc(capacity * sizeof(seq_info));
+    // CHANGED: separate capacity variables for each file
+    size_t cap_forward = 10000, cap_reverse = 10000, cap_additional = 10000;
+
+    arr_forward = malloc(cap_forward * sizeof(seq_info));
     if (!arr_forward) { perror("malloc"); exit(1); }
-    arr_reverse = malloc(capacity * sizeof(seq_info));
+    arr_reverse = malloc(cap_reverse * sizeof(seq_info));
     if (!arr_reverse) { perror("malloc"); exit(1); }
     if (additional_file) {
-        arr_additional = malloc(capacity * sizeof(seq_info));
+        arr_additional = malloc(cap_additional * sizeof(seq_info));
         if (!arr_additional) { perror("malloc"); exit(1); }
     }
 
     printf("\n---Training model---\n");
     hm = CreateHashTable();
 
-    int max_id_forward = train_model(forward_file, arr_forward);
-    int max_id_reverse = train_model(reverse_file, arr_reverse);
+    // CHANGED: pass pointer to array pointer and pointer to capacity
+    int max_id_forward = train_model(forward_file, &arr_forward, &cap_forward);
+    int max_id_reverse = train_model(reverse_file, &arr_reverse, &cap_reverse);
     int max_id_additional = 0;
     if (additional_file) {
-        max_id_additional = train_model(additional_file, arr_additional);
+        max_id_additional = train_model(additional_file, &arr_additional, &cap_additional);
     }
 
     fix_overlap_values();
